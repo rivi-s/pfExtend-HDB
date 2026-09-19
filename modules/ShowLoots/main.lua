@@ -1,6 +1,7 @@
 PfExtend_Database["ShowLoots"] = {
     ["LootData"] = {},
     ["itemQualityData"] = {},
+    ["itemNameData"] = {},
     ["updated"] = false,
     ["version"] = nil
 };
@@ -16,10 +17,60 @@ PFEXShowLoots = {
 local isShown = false;
 local compat = pfExtendCompat;
 
+-- HDB owns unit drops when the SQLite provider is loaded. Follows the same
+-- detection convention as the rest of the pfQuest-HDB family (patchtable.lua
+-- etc.): a live capability check, not a hardcoded dependency on the addon name.
+-- Checked fresh every call rather than cached once: pfExtend.toc only depends
+-- on pfQuest, not on the HDB provider addon, so there's no guarantee
+-- pfQuestHearthDB exists yet at the moment this file's top level runs.
+local function HasHDB()
+    return pfQuestHearthDB and type(pfQuestHearthDB.GetUnitDropsAsync) == "function"
+        and type(pfQuestHearthDB.GetEntitiesByTitleAsync) == "function"
+end
+
+-- Resolves an item's display name from whichever source has it: the HDB
+-- title cached off the last drop query, the legacy Lua database, or (last
+-- resort, since it may not be client-cached yet) the game's own item info.
+-- Defensive: PfExtend_Database is a SavedVariable, and the top-level literal
+-- above only sets itemNameData on a *fresh* table. If this saved table
+-- somehow survives from a session predating this field (observed in testing:
+-- itemNameData missing at runtime despite the load-time literal setting it),
+-- self-heal instead of erroring on every mouseover.
+local function GetShowLootsCache()
+    local db = PfExtend_Database["ShowLoots"]
+    if db.itemNameData == nil then db.itemNameData = {} end
+    if db.itemQualityData == nil then db.itemQualityData = {} end
+    return db
+end
+
+-- Exposed for browser.lua, which reads/writes the same quality cache from a
+-- separate file scope and needs the same self-healing guard.
+PFEXShowLoots.GetItemQualityData = function()
+    return GetShowLootsCache().itemQualityData
+end
+
+PFEXShowLoots.GetItemName = function(id)
+    local name = GetShowLootsCache().itemNameData[id]
+    if name then return name end
+    if pfDB and pfDB.items and pfDB.items.loc and pfDB.items.loc[id] then
+        return pfDB.items.loc[id]
+    end
+    return GetItemInfo(id) or UNKNOWN
+end
+
 
 
 
 PFEXShowLoots.UpdateDatabase = function()
+    if HasHDB() then
+        -- No precomputed cache to build: GetUnitDropsAsync is queried per
+        -- unit on hover and caches itself inside the provider.
+        PfExtend_Database["ShowLoots"]["LootData"] = {};
+        PfExtend_Database["ShowLoots"]["updated"] = true;
+        DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080"..pfExtend_Loc["Update_Success_Hint"])
+        return true;
+    end
+
     if pfDB == nil or pfDB["items"]["data"] == nil then
         DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080"..pfExtend_Loc["Update_Error_Hint"]);
         return false;
@@ -66,6 +117,72 @@ end
 
 
 
+
+-- Shared between the legacy and HDB tooltip builders: turns a flat drop list
+-- into the {id, chance, r, g, b} rows the tooltip/browser already expect,
+-- applying the same favorite-item bump the Lua-table path used.
+local function BuildLootRows(drops)
+    local itemNameData = GetShowLootsCache().itemNameData
+    local sortLootList = {}
+    for _, drop in ipairs(drops) do
+        local chance = drop.chance
+        if pfBrowser_fav and pfBrowser_fav["items"] and pfBrowser_fav["items"][drop.item] then
+            chance = chance + 100;
+        end
+        sortLootList[drop.item] = chance;
+        if drop.title then
+            itemNameData[drop.item] = drop.title;
+        end
+    end
+
+    local ret = {};
+    for _, v in ipairs(PfExtend_Global.sortKeyValueTable(sortLootList, "value", true)) do
+        local value = v.value > 100 and v.value - 100 or v.value;
+        local r, g, b = pfMap.tooltip:GetColor(tonumber(value), 100)
+        table.insert(ret, { v.key, value, r, g, b })
+    end
+    return ret;
+end
+
+-- HDB path: resolves the hovered name to a creature id via GetEntitiesByTitleAsync
+-- (filtered to the current zone, same as the old coords-match loop below), then
+-- fetches its drops directly instead of scanning a flattened whole-database cache.
+PFEXShowLoots.ModifyTooltipHDB = function()
+    local focus = GetMouseFocus();
+    if focus and focus.title then return end
+    if focus and focus.GetName and strsub((focus:GetName() or ""), 0, 10) == "QuestTimer" then return end
+
+    PFEXShowLoots.focus_name = getglobal("GameTooltipTextLeft1") and getglobal("GameTooltipTextLeft1"):GetText() or
+        "__NONE__"
+    PFEXShowLoots.focus_name = string.gsub(PFEXShowLoots.focus_name, "|c%x%x%x%x%x%x%x%x", "");
+    PFEXShowLoots.focus_name = string.gsub(PFEXShowLoots.focus_name, "|r", "");
+
+    local requestName = PFEXShowLoots.focus_name;
+    local focus_zone = pfMap:GetMapID(GetCurrentMapContinent(), GetCurrentMapZone())
+
+    pfQuestHearthDB:GetEntitiesByTitleAsync("U", requestName, function(records, err)
+        -- The cursor can move to a different unit before this resolves; a
+        -- result for a name that's no longer under the mouse is stale, drop it.
+        if PFEXShowLoots.focus_name ~= requestName then return end
+        if err or not records then return end
+
+        local matchID;
+        for _, record in ipairs(records) do
+            if record.zones[focus_zone] then
+                matchID = record.id;
+                break;
+            end
+        end
+        if not matchID then return end
+
+        pfQuestHearthDB:GetUnitDropsAsync(matchID, function(drops, dropErr)
+            if PFEXShowLoots.focus_name ~= requestName then return end
+            if dropErr or not drops then return end
+            PFEXShowLoots.LootListShown = BuildLootRows(drops);
+            isShown = false;
+        end)
+    end)
+end
 
 PFEXShowLoots.ModifyTooltip = function()
     local focus = GetMouseFocus();
@@ -122,34 +239,40 @@ end)
 
 pfMap.tooltip:SetScript("OnUpdate", function()
     if not PfExtend_Global.ReadSetting("ShowLoots", "enable") then return end
+    -- The browser window shows this same list properly; there's no reason
+    -- for the world-hover tooltip to do any work (let alone the string-heavy
+    -- rebuild below) while it's up. Belt-and-suspenders against the mouseover
+    -- OnEvent path that already skips itself while isBrowse is true.
+    if PFEXShowLoots.isBrowse then return end
     local num = table.getn(PFEXShowLoots.LootListShown);
     if not isShown then
         local i = 0;
         local j = 0;
         local miniq = PfExtend_Global.ReadSetting("ShowLoots", "itemQualityFilter")
         local showlines = {}
+        local itemQualityData = GetShowLootsCache().itemQualityData
         for _, l in ipairs(PFEXShowLoots.LootListShown) do
             local id, chance, r, g, b = unpack(l)
 
 
-            local itemQuality = PfExtend_Database["ShowLoots"]["itemQualityData"][id];
+            local itemQuality = itemQualityData[id];
             if itemQuality == nil then
                 local _, _, iq = GetItemInfo(id);
                 itemQuality = iq;
             end
             local itemLink;
             if type(itemQuality) == "number" then
-                PfExtend_Database["ShowLoots"]["itemQualityData"][id] = itemQuality;
+                itemQualityData[id] = itemQuality;
                 local itemColor                                       = "|c" .. string.format("%02x%02x%02x%02x", 255,
                     ITEM_QUALITY_COLORS[itemQuality].r * 255,
                     ITEM_QUALITY_COLORS[itemQuality].g * 255,
                     ITEM_QUALITY_COLORS[itemQuality].b * 255)
                 itemLink                                              = itemColor ..
-                    "|Hitem:" .. id .. compat.itemsuffix .. "|h[" .. pfDB.items.loc[id] .. "]|h|r"
+                    "|Hitem:" .. id .. compat.itemsuffix .. "|h[" .. PFEXShowLoots.GetItemName(id) .. "]|h|r"
             end
             if type(itemQuality) ~= "number" or itemQuality >= miniq then
                 if i < tonumber(PfExtend_Global.ReadSetting("ShowLoots", "showNum")) then
-                    itemLink = itemLink or "[" .. pfDB.items.loc[id] .. "]"
+                    itemLink = itemLink or "[" .. PFEXShowLoots.GetItemName(id) .. "]"
                     table.insert(showlines,
                         { ["itemLink"] = itemLink, ["chance"] = chance, ["r"] = r, ["g"] = g, ["b"] = b })
                     i = i + 1;
@@ -241,9 +364,15 @@ function PFEXShowLoots.OnEvent(event, arg1, arg2, arg3, arg4, arg5, arg6, arg7, 
         PFEXShowLoots.LootListShown = {}
         isShown = false;
         if (not UnitPlayerControlled("mouseover")) then
-            -- ModifyTooltip returns nil for a focus it refuses to describe, and
-            -- nil here makes the next ipairs() over the list an error.
-            PFEXShowLoots.LootListShown = PFEXShowLoots.ModifyTooltip() or {};
+            if HasHDB() then
+                -- Async: populates PFEXShowLoots.LootListShown itself once the
+                -- HDB query resolves, a tick or more from now.
+                PFEXShowLoots.ModifyTooltipHDB();
+            else
+                -- ModifyTooltip returns nil for a focus it refuses to describe, and
+                -- nil here makes the next ipairs() over the list an error.
+                PFEXShowLoots.LootListShown = PFEXShowLoots.ModifyTooltip() or {};
+            end
         end
     end
 end

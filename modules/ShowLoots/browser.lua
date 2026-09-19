@@ -21,6 +21,41 @@ local objects = pfDB["objects"]["data"]
 local refloot = pfDB["refloot"]["data"]
 local quests = pfDB["quests"]["data"]
 local zones = pfDB["zones"]["loc"]
+
+-- Same detection convention as main.lua: a live capability check on the
+-- provider, not a hardcoded dependency on which addon is installed. Checked
+-- fresh every call, not cached, since load order between pfExtend and the
+-- HDB provider addon isn't guaranteed (see main.lua's HasHDB comment).
+local function HasHDB()
+    return pfQuestHearthDB and type(pfQuestHearthDB.GetItemSourcesAsync) == "function"
+end
+
+-- Session cache of {kind, id, chance, title, zoneID, ...} rows per item id, so
+-- hovering the U/O/V icons doesn't re-query every time; ResultButtonReload
+-- primes this when a row is built, well before the player can hover it.
+local itemSourceCache = {}
+local itemSourcePending = {}
+
+-- Only called from user-driven actions (hover, click) now -- see
+-- ResultButtonReload for why the old eager per-row prefetch was removed
+-- instead of just throttled. One call per actual hover/click is naturally
+-- rate-limited by human interaction speed, no queue needed.
+local function FetchItemSources(id, callback)
+    if itemSourceCache[id] then callback(itemSourceCache[id]); return end
+    if itemSourcePending[id] then
+        table.insert(itemSourcePending[id], callback)
+        return
+    end
+    itemSourcePending[id] = { callback }
+    pfQuestHearthDB:GetItemSourcesAsync(id, function(record, err)
+        local sources = (not err and record and record.sources) or {}
+        itemSourceCache[id] = sources
+        local waiting = itemSourcePending[id]
+        itemSourcePending[id] = nil
+        for _, cb in ipairs(waiting) do cb(sources) end
+    end)
+end
+
 local openTime = nil;
 local windowWidthWithoutID = 400;
 local windowWidth = 0;
@@ -45,7 +80,7 @@ local function ResultButtonUpdate()
 
         local _, _, itemQuality = GetItemInfo(this.id)
         if itemQuality then
-            PfExtend_Database["ShowLoots"]["itemQualityData"][this.id] = itemQuality
+            PFEXShowLoots.GetItemQualityData()[this.id] = itemQuality
             local r = ceil(ITEM_QUALITY_COLORS[itemQuality].r * 255)
             local g = ceil(ITEM_QUALITY_COLORS[itemQuality].g * 255)
             local b = ceil(ITEM_QUALITY_COLORS[itemQuality].b * 255)
@@ -95,9 +130,56 @@ local function ResultButtonLeave()
     GameTooltip:Hide()
 end
 
+-- Vendor click has no HDB-aware adapter wrapper to call into (unlike U/O
+-- below), so this builds pfMap nodes itself from the same source rows
+-- ResultButtonEnterSpecialHDB already fetched, mirroring the node shape
+-- pfDatabase:SearchItemIDHDB builds for its own U/O sources.
+local function ShowVendorMapHDB(id, meta)
+    FetchItemSources(id, function(sources)
+        local maps = {}
+        local itemName = PFEXShowLoots.GetItemName(id)
+        for _, source in ipairs(sources) do
+            if source.kind == "V" and source.zoneID and source.x and source.y then
+                local nodeMeta = {}
+                for key, value in pairs(meta) do nodeMeta[key] = value end
+                nodeMeta.itemid = id
+                nodeMeta.item = itemName
+                nodeMeta.title = itemName
+                nodeMeta.spawn = source.title or UNKNOWN
+                nodeMeta.spawnid = source.id
+                nodeMeta.spawntype = pfQuest_Loc["Unit"]
+                nodeMeta.level = source.level or UNKNOWN
+                nodeMeta.zone = source.zoneID
+                nodeMeta.x, nodeMeta.y = source.x, source.y
+                nodeMeta.respawn = source.respawn and SecondsToTime(source.respawn) or "N/A"
+                nodeMeta.sellcount = source.chance
+                nodeMeta.texture = pfQuestConfig.path .. "\\img\\icon_vendor"
+                maps[source.zoneID] = (maps[source.zoneID] or 0) + 1
+                pfMap:AddNode(nodeMeta)
+            end
+        end
+        pfMap:UpdateNodes()
+        pfMap:ShowMapID(pfDatabase:GetBestMap(maps))
+    end)
+end
+
 local function ResultButtonClickSpecial()
     local param = this:GetParent()[this.parameter]
+    local id = this:GetParent().id
     local meta = { ["addon"] = "PFDB" }
+
+    if HasHDB() and type(pfDatabase.SearchItemIDHDB) == "function"
+        and (this.buttonType == "O" or this.buttonType == "U") and not this.selectState then
+        pfMap:UpdateNodes()
+        local accepted = pfDatabase:SearchItemIDHDB(id, meta, { [this.buttonType] = true }, function(maps)
+            pfMap:ShowMapID(pfDatabase:GetBestMap(maps))
+        end)
+        if accepted then return end
+    elseif HasHDB() and this.buttonType == "V" then
+        ShowVendorMapHDB(id, meta)
+        return
+    end
+
     local maps = {}
     if this.buttonType == "O" or this.buttonType == "U" then
         if this.selectState then
@@ -112,7 +194,56 @@ local function ResultButtonClickSpecial()
     pfMap:ShowMapID(pfDatabase:GetBestMap(maps))
 end
 
+-- HDB path: GetItemSourcesAsync already flattens direct and reference-loot
+-- sources into one list tagged by kind, so this replaces both the direct loop
+-- and the refloot-expansion loop the legacy branch below needs per kind.
+local function ResultButtonEnterSpecialHDB()
+    local id = this:GetParent().id
+    local kind = this.buttonType
+    local owner = this
+
+    FetchItemSources(id, function(sources)
+        -- The player can move to a different icon (or close the tooltip)
+        -- before this resolves; only draw it while still hovering the same button.
+        if not MouseIsOver(owner) then return end
+
+        local count, skip = 0, false
+        local lines = {}
+        for _, source in ipairs(sources) do
+            if source.kind == kind then
+                count = count + 1
+                if count > tooltip_limit then skip = true end
+                if not skip then
+                    local name = source.title or UNKNOWN
+                    if kind == "V" and source.chance and source.chance ~= 0 then
+                        name = name .. " (" .. source.chance .. ")"
+                    end
+                    local zoneName = source.zoneID and pfMap:GetMapNameByID(source.zoneID) or UNKNOWN
+                    table.insert(lines, { name, zoneName })
+                end
+            end
+        end
+        if count == 0 then return end
+
+        GameTooltip:SetOwner(PFEXShowLoots.Browser, "ANCHOR_CURSOR")
+        GameTooltip:SetText(kind == "V" and pfExtend_Loc["Sold by"] or pfExtend_Loc["Looted from"], .3, 1, .8)
+        for _, line in ipairs(lines) do
+            GameTooltip:AddDoubleLine(line[1], line[2], 1, 1, 1, .5, .5, .5)
+        end
+        if count > tooltip_limit then
+            GameTooltip:AddLine("\n" .. pfExtend_Loc["ToolTips_and"] .. " " .. (count - tooltip_limit) .. " " .. pfExtend_Loc["ToolTips_others"],
+                .8, .8, .8)
+        end
+        GameTooltip:Show()
+    end)
+end
+
 local function ResultButtonEnterSpecial()
+    if HasHDB() then
+        ResultButtonEnterSpecialHDB()
+        return
+    end
+
     local id = this:GetParent().id
     local count = 0
     local skip = false
@@ -261,11 +392,25 @@ local function ResultButtonReload(self)
     end
 
 
-    for _, key in ipairs({ "U", "O", "V" }) do
-        if items[self.id] and items[self.id][key] then
+    if HasHDB() then
+        -- No eager per-row fetch here anymore: opening the window used to
+        -- queue one GetItemSourcesAsync per loot row (up to dozens for a
+        -- heavy loot table), and even serialized to one-at-a-time that left
+        -- a backlog that was often still draining when the player closed
+        -- the window moments later -- which crashed the client. Icons are
+        -- shown unconditionally instead; hovering one lazily fetches (see
+        -- ResultButtonEnterSpecialHDB) and just shows nothing if that kind
+        -- has no sources, same as it already does for a real empty result.
+        for _, key in ipairs({ "U", "O", "V" }) do
             self[key]:Show()
-        else
-            self[key]:Hide()
+        end
+    else
+        for _, key in ipairs({ "U", "O", "V" }) do
+            if items[self.id] and items[self.id][key] then
+                self[key]:Show()
+            else
+                self[key]:Hide()
+            end
         end
     end
 
@@ -619,10 +764,10 @@ local function SortLootList(lootList)
             local _, _, qualityB = GetItemInfo(b[1])
             -- 如果缓存中没有，尝试从数据库获取
             if qualityA == nil then
-                qualityA = PfExtend_Database["ShowLoots"]["itemQualityData"][a[1]]
+                qualityA = PFEXShowLoots.GetItemQualityData()[a[1]]
             end
             if qualityB == nil then
-                qualityB = PfExtend_Database["ShowLoots"]["itemQualityData"][b[1]]
+                qualityB = PFEXShowLoots.GetItemQualityData()[b[1]]
             end
             -- 如果都没有，默认为0（灰色）
             qualityA = qualityA or 0
@@ -655,6 +800,17 @@ end
 -- Sort and draw the snapshot. Called on open and again after every sort click;
 -- deliberately does not touch PFEXShowLoots.LootListShown, which by then
 -- reflects wherever the cursor happens to be rather than the mob on display.
+-- Some creatures share a large reference-loot pool with a whole family of
+-- similar mobs (a raptor with a broad shared reference bucket has turned up
+-- 400+ distinct possible items in testing, confirmed for real against the
+-- HDB data, not a matching bug). Each row is a live button whose Reload
+-- restarts a GetItemInfo/SetHyperlink polling loop for its first ~10 frames,
+-- so rendering hundreds of them at once means thousands of tooltip calls in
+-- a single burst -- that's what was making the window laggy to browse, not
+-- a leak. Cap what actually gets rendered; the list is already sorted by
+-- chance first, so this keeps the parts anyone would actually look at.
+local MAX_VISIBLE_LOOT_ROWS = 150
+
 PopulateLootList = function()
     -- 更新排序按钮高亮状态和文本
     for _, button in ipairs({"sortByChance", "sortById", "sortByQuality"}) do
@@ -667,14 +823,16 @@ PopulateLootList = function()
 
     -- 排序掉落列表
     local sortedLootList = SortLootList(shownLootList)
+    local total = table.getn(sortedLootList)
 
     local i = 0
     for _, l in ipairs(sortedLootList) do
+        if i >= MAX_VISIBLE_LOOT_ROWS then break end
         local id, chance, r, g, b = unpack(l)
         i = i + 1
         PFEXShowLoots.Browser.scroll.buttons[i] = PFEXShowLoots.Browser.scroll.buttons[i] or ResultButtonCreate(i)
         PFEXShowLoots.Browser.scroll.buttons[i].id = id
-        PFEXShowLoots.Browser.scroll.buttons[i].name = pfDB.items.loc[id]
+        PFEXShowLoots.Browser.scroll.buttons[i].name = PFEXShowLoots.GetItemName(id)
         PFEXShowLoots.Browser.scroll.buttons[i].chance = chance
         PFEXShowLoots.Browser.scroll.buttons[i].chanceR = r
         PFEXShowLoots.Browser.scroll.buttons[i].chanceG = g
@@ -682,6 +840,11 @@ PopulateLootList = function()
         PFEXShowLoots.Browser.scroll.buttons[i]:Reload()
     end
     RefreshView(i)
+
+    if total > MAX_VISIBLE_LOOT_ROWS then
+        DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080pfExtend ShowLoots: " .. (total - MAX_VISIBLE_LOOT_ROWS)
+            .. " additional low-chance items not shown (shared reference loot pool)")
+    end
 end
 
 PFEXShowLoots.Browser:SetScript("OnShow", function()

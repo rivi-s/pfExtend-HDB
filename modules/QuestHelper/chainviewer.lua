@@ -111,7 +111,11 @@ local function GetChainRow(index)
     row:SetScript("OnEnter", function()
         row.hl:Show()
         if row.questid then
-            pfDatabase:ShowExtendedTooltip(row.questid, GameTooltip, row, "ANCHOR_RIGHT", 0, 0)
+            local shown = type(pfDatabase.ShowExtendedTooltipHDB) == "function"
+                and pfDatabase:ShowExtendedTooltipHDB(row.questid, GameTooltip, row, "ANCHOR_RIGHT", 0, 0)
+            if not shown then
+                pfDatabase:ShowExtendedTooltip(row.questid, GameTooltip, row, "ANCHOR_RIGHT", 0, 0)
+            end
         end
     end)
     row:SetScript("OnLeave", function()
@@ -138,37 +142,50 @@ function frame:ShowChain(questid)
     AnchorToQuestLog()
     PFEXQuestHelper.GetPlayerData()
 
-    local name = pfDB["quests"]["loc"][questid] and pfDB["quests"]["loc"][questid]["T"] or "?"
+    local name = PFEXQuestHelper.GetQuestTitle(questid) or "?"
     self.title:SetText("|cff33ffcc" .. pfExtend_Loc["QuestHelper_ChainTitle"] .. "|r " .. name)
 
-    local tree = PFEXQuestHelper.QuestChainBuilder({ questid })
-    local list = {}
-    FlattenTree(tree, 0, list)
+    local function RenderChain()
+        local tree = PFEXQuestHelper.QuestChainBuilder({ questid })
+        local list = {}
+        FlattenTree(tree, 0, list)
 
-    for i, entry in ipairs(list) do
-        local row = GetChainRow(i)
-        row.questid = entry.data.id
-        row.text:ClearAllPoints()
-        row.text:SetPoint("LEFT", 4 + entry.level * INDENT, 0)
-        row.text:SetText(PFEXQuestHelper.FormatQuestText(entry.data.flag, entry.data.id))
-        row:Show()
-    end
-    for j = table.getn(list) + 1, table.getn(chainRows) do
-        chainRows[j]:Hide()
+        for i, entry in ipairs(list) do
+            local row = GetChainRow(i)
+            row.questid = entry.data.id
+            row.text:ClearAllPoints()
+            row.text:SetPoint("LEFT", 4 + entry.level * INDENT, 0)
+            row.text:SetText(PFEXQuestHelper.FormatQuestText(entry.data.flag, entry.data.id))
+            row:Show()
+        end
+        for j = table.getn(list) + 1, table.getn(chainRows) do
+            chainRows[j]:Hide()
+        end
+
+        if table.getn(list) == 0 then
+            local row = GetChainRow(1)
+            row.questid = nil
+            row.text:ClearAllPoints()
+            row.text:SetPoint("LEFT", 4, 0)
+            row.text:SetText("|cff9d9d9d" .. pfExtend_Loc["QuestHelper_ChainEmpty"] .. "|r")
+            row:Show()
+        end
+
+        self.content:SetHeight(math.max(table.getn(list) * LINE_HEIGHT, self:GetHeight() - 40))
+        self.scroll:SetVerticalScroll(0)
     end
 
-    if table.getn(list) == 0 then
-        local row = GetChainRow(1)
-        row.questid = nil
-        row.text:ClearAllPoints()
-        row.text:SetPoint("LEFT", 4, 0)
-        row.text:SetText("|cff9d9d9d" .. pfExtend_Loc["QuestHelper_ChainEmpty"] .. "|r")
-        row:Show()
-    end
-
-    self.content:SetHeight(math.max(table.getn(list) * LINE_HEIGHT, self:GetHeight() - 40))
-    self.scroll:SetVerticalScroll(0)
+    -- Same requirement as OnMapChange: QuestChainBuilder calls QuestFilter
+    -- synchronously while recursing, so every id this chain could reach
+    -- needs its metadata cached first. This is a click-triggered popup, not
+    -- a hot path, so showing the window immediately and filling it a moment
+    -- later reads fine.
     self:Show()
+    if PFEXQuestHelper.HasHDB() then
+        PFEXQuestHelper.PrefetchQuestMeta(PFEXQuestHelper.CollectTreeQuestIDs({ questid }), RenderChain)
+    else
+        RenderChain()
+    end
 end
 
 -- ============================================================

@@ -20,6 +20,190 @@ PFEXQuestHelper = {
 
 
 
+-- Same detection convention used across the ShowLoots conversion: a live
+-- capability check on the provider, not a hardcoded dependency on the addon.
+-- Checked fresh every call, not cached: pfExtend.toc only depends on pfQuest,
+-- not on the HDB provider addon, so load order between the two isn't
+-- guaranteed -- a one-time check at file-load could see pfQuestHearthDB as
+-- nil and lock this module onto the (here, empty) legacy path all session.
+local function HasHDB()
+    return pfQuestHearthDB and type(pfQuestHearthDB.GetQuestStartPinsAsync) == "function"
+        and type(pfQuestHearthDB.GetQuestEligibilityAsync) == "function"
+end
+
+-- GetQuestStartPinsAsync (called once in UpdateDatabase) already carries a
+-- quest's title and which start "routes" it has (direct NPC/object talk vs.
+-- item-start); both are cached here since they cost nothing extra to keep.
+local questTitleCache = {}
+local questStartFlagCache = {}
+
+-- Raw start-pin rows (zone/x/y/targetKind/targetID/title/level/respawn) per
+-- quest id, stashed from the same sweep. This is what lets map-pin placement
+-- (see AddMapNodeHDB in browser.lua) be synchronous instead of firing a
+-- GetQuestMapPinsAsync per tree node -- a zone's tree can have 100+ nodes,
+-- and that's exactly the per-node-burst pattern that already crashed the
+-- client twice this session (loot browser rows, then quest metadata).
+local questStartPinRows = {}
+
+-- Per-quest level/race/class/skill/event/prerequisites, from
+-- GetQuestEligibilityAsync. GetQuestStartPinsAsync doesn't carry the race/class
+-- masks QuestFilter needs, so this is fetched lazily per quest instead, and
+-- cached since the same quest reappears across zones/sorts/re-renders.
+local QUEST_NOT_FOUND = {}
+local questMetaCache = {}
+local questMetaPending = {}
+
+-- A zone's full tree (root quests plus everything reachable through
+-- QuestAfter) can be dozens of ids, and PrefetchQuestMeta used to fire a
+-- GetQuestEligibilityAsync for every one of them in the same frame -- the
+-- same pattern that crashed the client when ShowLoots's browser fired one
+-- GetItemSourcesAsync per loot row on open. Serialize the actual queries
+-- through this queue instead; FetchQuestMeta enqueues rather than firing
+-- directly, so every caller (this prefetch, QuestFilter's opportunistic
+-- fetch, FindPreUndo) is covered without needing its own throttling. Holds
+-- generic jobs (not just quest ids) so the title backfill below can share it.
+local workQueue = {}
+local workActive = false
+local workPaused = false
+
+local function PumpWorkQueue()
+    if workActive or workPaused then return end
+    local job = table.remove(workQueue, 1)
+    if not job then return end
+    workActive = true
+    job(function()
+        workActive = false
+        PumpWorkQueue()
+    end)
+end
+
+local function QueueWork(job)
+    table.insert(workQueue, job)
+    PumpWorkQueue()
+end
+
+-- Pauses/resumes the queue without cancelling anything in flight or dropping
+-- pending callbacks, so closing the panel mid-fetch can't leave a callback
+-- waiting forever. Wired to the browser's OnHide/OnShow.
+PFEXQuestHelper.SetMetaFetchPaused = function(paused)
+    workPaused = paused
+    if not paused then PumpWorkQueue() end
+end
+
+local function FetchQuestMeta(id, callback)
+    local cached = questMetaCache[id]
+    if cached ~= nil then
+        callback(cached ~= QUEST_NOT_FOUND and cached or nil)
+        return
+    end
+    if questMetaPending[id] then
+        table.insert(questMetaPending[id], callback)
+        return
+    end
+    questMetaPending[id] = { callback }
+
+    QueueWork(function(jobDone)
+        pfQuestHearthDB:GetQuestEligibilityAsync(id, function(record, err)
+            local result = (not err) and record or nil
+            questMetaCache[id] = result or QUEST_NOT_FOUND
+            jobDone() -- release this queue slot; a title backfill below queues separately
+
+            local function Resolve()
+                local waiting = questMetaPending[id]
+                questMetaPending[id] = nil
+                if waiting then
+                    for _, cb in ipairs(waiting) do cb(result) end
+                end
+            end
+
+            -- GetQuestStartPinsAsync only carries a title for quests with a
+            -- recorded, spawn-joined start location -- roughly 8% of quests
+            -- have none (confirmed against the actual DB: 538 of 6701),
+            -- concentrated in auto-offered chain follow-ups, i.e. exactly
+            -- what QuestAfter pulls into a tree. Those never got a
+            -- questTitleCache entry from the pins sweep and would otherwise
+            -- show "Unknown" forever despite having valid quest_meta data.
+            -- Backfill from quest_text directly, only for the ids that
+            -- actually need it, still through this same serial queue.
+            if result and not questTitleCache[id] then
+                QueueWork(function(titleJobDone)
+                    pfQuestHearthDB:GetQuestTextAsync(id, function(textRecord, textErr)
+                        if not textErr and textRecord and textRecord.title then
+                            questTitleCache[id] = textRecord.title
+                        end
+                        titleJobDone()
+                        Resolve()
+                    end)
+                end)
+            else
+                Resolve()
+            end
+        end)
+    end)
+end
+
+-- Fetches metadata for a batch of quest ids and calls back once every one of
+-- them has resolved (or is already cached). Used to prime the cache for a
+-- whole tree before QuestChainBuilder walks it synchronously.
+local function PrefetchQuestMeta(idList, callback)
+    local pending = table.getn(idList)
+    if pending == 0 then callback(); return end
+    local done = false
+    for _, id in ipairs(idList) do
+        FetchQuestMeta(id, function()
+            pending = pending - 1
+            if pending == 0 and not done then
+                done = true
+                callback()
+            end
+        end)
+    end
+end
+
+-- Pure local walk over the already-resident QuestAfter graph: everything
+-- reachable forward from the zone's quest list, i.e. every id the tree
+-- builder could touch. No DB access -- QuestAfter is built once up front.
+local function CollectTreeQuestIDs(questList)
+    local seen, result = {}, {}
+    local function Walk(id)
+        if seen[id] then return end
+        seen[id] = true
+        table.insert(result, id)
+        local after = PfExtend_Database["QuestHelper"]["QuestAfter"][id]
+        if after then
+            for _, nextId in ipairs(after) do
+                Walk(nextId)
+            end
+        end
+    end
+    for _, id in ipairs(questList) do
+        Walk(id)
+    end
+    return result
+end
+
+-- Exposed for chainviewer.lua, which builds a chain tree from a single click
+-- (outside the OnMapChange flow) and needs the same "prefetch before building"
+-- sequencing.
+PFEXQuestHelper.HasHDB = HasHDB
+PFEXQuestHelper.CollectTreeQuestIDs = CollectTreeQuestIDs
+PFEXQuestHelper.PrefetchQuestMeta = PrefetchQuestMeta
+PFEXQuestHelper.QueueWork = QueueWork
+
+-- browser.lua's AddMapNodeHDB reads this directly (synchronous, no query)
+-- to place start-location pins.
+PFEXQuestHelper.GetQuestStartPinRows = function(id)
+    return questStartPinRows[id]
+end
+
+PFEXQuestHelper.GetQuestTitle = function(id)
+    if questTitleCache[id] then return questTitleCache[id] end
+    if pfDB and pfDB.quests and pfDB.quests.loc and pfDB.quests.loc[id] then
+        return pfDB.quests.loc[id]["T"]
+    end
+    return nil
+end
+
 local items, units, objects, quests, zones, refloot, itemreq, areatrigger, professions
 PFEXQuestHelper.Reload = function()
     items = pfDB["items"]["data"]
@@ -40,9 +224,14 @@ PFEXQuestHelper.Reload = function()
             ["version"] = nil,
         };
     end
-    if PfExtend_Database["QuestHelper"]["QuestAfter"] == nil then
-        PfExtend_Database["QuestHelper"]["QuestAfter"] = {}
-    end
+    -- Defensive per-field, not just on the outer table: a saved table from a
+    -- shape predating one of these fields would otherwise skip the block
+    -- above entirely (it already exists) and leave that field nil, which
+    -- every direct index into it downstream assumes never happens.
+    local qh = PfExtend_Database["QuestHelper"]
+    if qh["QuestZoneData"] == nil then qh["QuestZoneData"] = {} end
+    if qh["ZoneQuestData"] == nil then qh["ZoneQuestData"] = {} end
+    if qh["QuestAfter"] == nil then qh["QuestAfter"] = {} end
 end
 
 PFEXQuestHelper.Reload()
@@ -64,11 +253,21 @@ PFEXQuestHelper.GetPlayerData = function()
 end
 
 PFEXQuestHelper.FindPreUndo = function(id)
-    if quests[id]["pre"] then
+    local pre
+    if HasHDB() then
+        local meta = questMetaCache[id]
+        if meta and meta ~= QUEST_NOT_FOUND and table.getn(meta.prerequisites) > 0 then
+            pre = meta.prerequisites
+        end
+    elseif quests[id]["pre"] then
+        pre = quests[id]["pre"]
+    end
+
+    if pre then
         local one_complete = nil
         local level = 0
         local thislevel = 0
-        for _, prequest in pairs(quests[id]["pre"]) do
+        for _, prequest in pairs(pre) do
             thislevel = 1
             if not pfQuest_history[prequest] then
                 local flag = PFEXQuestHelper.QuestFilter(prequest)
@@ -110,6 +309,56 @@ PFEXQuestHelper.QuestFilter = function(id)
         STARTOBJECT = false,   --从实体单位接取
         STARTITEM = false,     --从物品接取
     }
+
+    if HasHDB() then
+        local meta = questMetaCache[id]
+        if meta == nil then
+            -- Not prefetched (e.g. a prerequisite outside the displayed
+            -- tree, reached via FindPreUndo). Kick off a fetch so it's ready
+            -- next time; this call itself has to report something now.
+            FetchQuestMeta(id, function() end)
+            ret.UNKNOWN = true
+            return ret
+        end
+        if meta == QUEST_NOT_FOUND then ret.UNKNOWN = true return ret end
+
+        if meta.level and meta.level ~= "" then ret.lvl = tonumber(meta.level) end
+        if meta.minLevel and meta.minLevel ~= "" then
+            ret.min = tonumber(meta.minLevel)
+            if ret.min > PFEXQuestHelper.plevel then ret.LOWLEVEL = true end
+        end
+        if pfQuest.questlog[id] then ret.DOING = true end
+        if pfQuest_history[id] then ret.FINISHED = true end
+        if not PFEXQuestHelper.GetQuestTitle(id) then ret.UNKNOWN = true end
+        if table.getn(meta.prerequisites) > 0 then
+            ret.HASPRE = true
+            local one_complete = nil
+            for _, prequest in ipairs(meta.prerequisites) do
+                if pfQuest_history[prequest] then
+                    one_complete = true
+                end
+            end
+            if not one_complete then ret.UNDOPRE = true end
+        end
+        local raceMask = tonumber(meta.raceMask)
+        local classMask = tonumber(meta.classMask)
+        if raceMask and not (bit.band(raceMask, PFEXQuestHelper.prace) == PFEXQuestHelper.prace) then ret.WRONGRACE = true end
+        if classMask and not (bit.band(classMask, PFEXQuestHelper.pclass) == PFEXQuestHelper.pclass) then ret.WRONGCLASS = true end
+        if meta.skill and meta.skill ~= "" and not pfDatabase:GetPlayerSkill(meta.skill) then ret.WRONGSKILL = true end
+        if meta.event and meta.event ~= "" then ret.EVENT = true end
+
+        -- Faction is already applied when the zone index is built (HDB is
+        -- queried scoped to the player's own faction in UpdateDatabase), so
+        -- an entry that made it into the index is reachable by construction;
+        -- there's no separate WRONGFACTION signal left to recompute here.
+        local flags = questStartFlagCache[id]
+        if flags then
+            ret.STARTUNIT = flags.U
+            ret.STARTOBJECT = flags.O
+            ret.STARTITEM = flags.I
+        end
+        return ret
+    end
 
     if not quests[id] then ret.UNKNOWN = true return ret end
 
@@ -198,8 +447,9 @@ PFEXQuestHelper.FormatQuestText = function(flag, id)
         tag = pfExtend_Loc["QuestHelper_FLAG_Available"]
     end
 
-    if pfDB["quests"]["loc"] and pfDB["quests"]["loc"][id] then
-        return color .. tag .. "  " .. pfDB["quests"]["loc"][id]["T"]
+    local title = PFEXQuestHelper.GetQuestTitle(id)
+    if title then
+        return color .. tag .. "  " .. title
     end
     return "|cff9d9d9dUnknown|r"
 end
@@ -269,7 +519,117 @@ PFEXQuestHelper.GetStartZones = function(id)
     return table.unique(ret)
 end
 
+-- Builds QuestZoneData/ZoneQuestData/QuestAfter from a single
+-- GetQuestStartPinsAsync sweep instead of walking the whole quest+item+unit
+-- database: the "resolved_start" query on the provider side already expands
+-- item-start quests through their loot sources, so this only needs to fold
+-- its rows into the same three indexes the legacy walk built by hand.
+-- Scoped to the player's own faction/masks disabled (0), matching the
+-- original's "build the full static index once" shape -- WRONGRACE/CLASS
+-- stay QuestFilter's job, applied per player state at render time.
+PFEXQuestHelper.UpdateDatabaseHDB = function()
+    local faction = PFEXQuestHelper.pfaction == "H" and "H" or "A"
+    local accepted = pfQuestHearthDB:GetQuestStartPinsAsync({
+        raceMask = 0, classMask = 0, faction = faction,
+        includeAllLevels = true, includeLow = true, includeEvents = true,
+    }, function(pins, err)
+        if err or not pins then
+            DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080" .. pfExtend_Loc["Update_Error_Hint"]);
+            return
+        end
+
+        local zoneSets = {}
+        local seenPrereqEdge = {}
+        wipe(PfExtend_Database["QuestHelper"]["QuestAfter"])
+        wipe(questStartFlagCache)
+        wipe(questStartPinRows)
+
+        for _, pin in ipairs(pins) do
+            local qid = pin.questID
+            questTitleCache[qid] = pin.quest
+
+            zoneSets[qid] = zoneSets[qid] or {}
+            if pin.zoneID then zoneSets[qid][pin.zoneID] = true end
+
+            if pin.zoneID and pin.x and pin.y then
+                if questStartPinRows[qid] == nil then questStartPinRows[qid] = {} end
+                table.insert(questStartPinRows[qid], {
+                    zoneID = pin.zoneID, x = pin.x, y = pin.y,
+                    targetKind = pin.targetKind, targetID = pin.targetID,
+                    title = pin.title, level = pin.level, respawn = pin.respawn,
+                })
+            end
+
+            local flags = questStartFlagCache[qid]
+            if not flags then
+                flags = { U = false, O = false, I = false }
+                questStartFlagCache[qid] = flags
+            end
+            if pin.originKind == "I" then
+                flags.I = true
+            elseif pin.originKind == pin.targetKind and pin.targetKind == "U" then
+                flags.U = true
+            elseif pin.originKind == pin.targetKind and pin.targetKind == "O" then
+                flags.O = true
+            end
+
+            -- GROUP_CONCAT gives the same string on every pin row for this
+            -- quest; only fold it into QuestAfter once per quest id.
+            if pin.prerequisites and not seenPrereqEdge[qid] then
+                seenPrereqEdge[qid] = true
+                for prereq in string.gfind(pin.prerequisites, "[^,]+") do
+                    local prereqId = tonumber(prereq)
+                    if prereqId then
+                        local after = PfExtend_Database["QuestHelper"]["QuestAfter"]
+                        if after[prereqId] == nil then after[prereqId] = {} end
+                        if not table.contain(after[prereqId], qid) then
+                            table.insert(after[prereqId], qid)
+                        end
+                    end
+                end
+            end
+        end
+
+        local questZoneData, zoneQuestData = {}, {}
+        for qid, zoneSet in pairs(zoneSets) do
+            local zoneList = {}
+            for zoneId in pairs(zoneSet) do table.insert(zoneList, zoneId) end
+            questZoneData[qid] = zoneList
+            local multiNum = table.getn(zoneList)
+            for _, zoneId in ipairs(zoneList) do
+                if zoneQuestData[zoneId] == nil then zoneQuestData[zoneId] = {} end
+                zoneQuestData[zoneId][qid] = multiNum
+            end
+        end
+
+        PfExtend_Database["QuestHelper"]["QuestZoneData"] = questZoneData
+        PfExtend_Database["QuestHelper"]["ZoneQuestData"] = zoneQuestData
+        PfExtend_Database["QuestHelper"]["updated"] = true
+        PFEXQuestHelper.cacheKey = nil
+        DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080" .. pfExtend_Loc["Update_Success_Hint"])
+
+        -- This is a single unfiltered sweep of the whole quest database, so
+        -- it can easily still be running when the player opens the map right
+        -- after login -- OnMapChange would then cache an empty tree built
+        -- before any data existed, and nothing would ever rebuild it since
+        -- the cache key alone doesn't know the data was incomplete. Rebuild
+        -- now if the panel is already open instead of waiting for the next
+        -- zone change to notice the cache was cleared above.
+        if PFEXQuestHelper.Browser and PFEXQuestHelper.Browser:IsShown() then
+            PFEXQuestHelper.OnMapChange()
+        end
+    end)
+
+    if not accepted then
+        DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080" .. pfExtend_Loc["Update_Error_Hint"]);
+        return false;
+    end
+    return true;
+end
+
 PFEXQuestHelper.UpdateDatabase = function()
+    if HasHDB() then return PFEXQuestHelper.UpdateDatabaseHDB() end
+
     if pfDB == nil or (pfDB["zones"]["data"] == nil and pfDB["quests"]["data"] == nil) then
         DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080" .. pfExtend_Loc["Update_Error_Hint"]);
         return false;
@@ -565,8 +925,14 @@ end
 local function GetQuestLogFingerprint()
     local count, sum = 0, 0
     for id in pairs(pfQuest.questlog) do
-        count = count + 1
-        sum = sum + id
+        -- pfQuest.questlog can carry non-numeric bookkeeping keys alongside
+        -- quest ids on this build; only real quest ids count toward the
+        -- fingerprint, and a stray key just gets left out of it.
+        local numericId = tonumber(id)
+        if numericId then
+            count = count + 1
+            sum = sum + numericId
+        end
     end
     return count .. ":" .. sum
 end
@@ -611,7 +977,6 @@ PFEXQuestHelper.OnMapChange = function()
     PFEXQuestHelper.cacheKey = key
 
     local questList = {}
-    local q2z = PfExtend_Database["QuestHelper"]["QuestZoneData"]
     local z2q = PfExtend_Database["QuestHelper"]["ZoneQuestData"]
     if z2q[PFEXQuestHelper.zone] then
         for k, _ in pairs(z2q[PFEXQuestHelper.zone]) do
@@ -628,8 +993,25 @@ PFEXQuestHelper.OnMapChange = function()
         end
     end
     questList = table.unique(questList)
-    PFEXQuestHelper.TreeData = PFEXQuestHelper.QuestChainBuilder(questList);
-    PFEXQuestHelper.Browser:BuildTree(PFEXQuestHelper.TreeData)
+
+    local requestKey = key
+    local function BuildAndShow()
+        -- The zone can change again while metadata is still in flight; a
+        -- tree built for a request that's no longer current is stale.
+        if PFEXQuestHelper.cacheKey ~= requestKey then return end
+        PFEXQuestHelper.TreeData = PFEXQuestHelper.QuestChainBuilder(questList);
+        PFEXQuestHelper.Browser:BuildTree(PFEXQuestHelper.TreeData)
+    end
+
+    if HasHDB() then
+        -- QuestChainBuilder calls QuestFilter synchronously while recursing,
+        -- so every id it could touch (the zone's quests plus everything
+        -- reachable forward through QuestAfter) needs its metadata cached
+        -- before the tree gets built, not looked up as it goes.
+        PrefetchQuestMeta(CollectTreeQuestIDs(questList), BuildAndShow)
+    else
+        BuildAndShow()
+    end
 end
 
 
@@ -670,7 +1052,27 @@ PFEXQuestHelper.OnEvent = function(event, arg1, arg2, arg3, arg4, arg5, arg6, ar
         PFEXQuestHelper.GetPlayerData()
         local version = PfExtend_Config_Template["About"].Version().text
         version = version .. "|" .. tostring(GetAddOnMetadata("pfQuest-octo", "Version") or "nopack")
-        if not PfExtend_Database["QuestHelper"]["updated"] or PfExtend_Database["QuestHelper"]["version"] ~= version then
+        if HasHDB() then
+            -- Gate on questStartPinRows, not on PfExtend_Database's own
+            -- updated/version/ZoneQuestData flags: this session already
+            -- caught PfExtend_Database (a SavedVariable) retaining old field
+            -- values in ways this addon's own reset code doesn't fully
+            -- explain (see the itemNameData self-healing fix in ShowLoots).
+            -- Concretely: ZoneQuestData from an earlier session looked
+            -- populated enough to skip the rebuild, so questStartPinRows --
+            -- added in a later pass -- never got populated this session even
+            -- though the quest tree still rendered fine from the leftover
+            -- data. questStartPinRows is a plain session-local Lua table, not
+            -- a SavedVariable, so it cannot carry that same stale state
+            -- across a reload -- empty reliably means "not swept yet this
+            -- session" without re-running the sweep on every zone change.
+            if next(questStartPinRows) == nil then
+                PFEXQuestHelper.UpdateDatabase();
+            end
+            PfExtend_Database["QuestHelper"]["version"] = version
+        elseif not PfExtend_Database["QuestHelper"]["updated"] or PfExtend_Database["QuestHelper"]["version"] ~= version then
+            -- Legacy path: the full Lua-table walk is genuinely expensive,
+            -- so skipping it when nothing changed is worth keeping here.
             PFEXQuestHelper.UpdateDatabase();
             PfExtend_Database["QuestHelper"]["version"] = version
         end

@@ -1,8 +1,9 @@
 ## Interface: 11200
-## Title: |cff33ffccpf|cffffffffExtend
+## Title: |cff33ffccpf|cffffffffExtend|r |cff00aeff[HDB]|r
 ## Author: Cliencer
-## Version: 1.1.0
-## Notes: Display all monster drops, query the task chain. This module is based on pfQuest. Command: /pfex
+## Contributors: rivi-s
+## Version: 0.1.0
+## Notes: Display all monster drops, query the task chain. This module is based on pfQuest. Command: /pfex. HDB fork: queries pfQuest-HearthDB (SQLite) instead of the legacy Lua database when available, with the original Lua-table path kept as a fallback.
 ## Title-zhCN:|CFF33AAFF[辅助]|RpfQuest扩展
 ## Notes-zhCN: 显示怪物全部掉落，任务链查询|N命令：/pfex
 ## Dependencies: pfQuest

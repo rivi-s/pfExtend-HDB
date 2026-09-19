@@ -26,8 +26,12 @@ PFEXQuestHelper.Browser:SetFrameStrata("FULLSCREEN_DIALOG")
 
 PFEXQuestHelper.Browser:SetScript("OnHide", function()
     PFEXQuestHelper.MapToggleButton:Show()
+    -- Don't keep firing quest-metadata queries for a tree the player isn't
+    -- looking at anymore; resumes on OnShow via OnMapChange's own prefetch.
+    PFEXQuestHelper.SetMetaFetchPaused(true)
 end)
 PFEXQuestHelper.Browser:SetScript("OnShow", function()
+    PFEXQuestHelper.SetMetaFetchPaused(false)
     -- OnMapChange内部已带缓存判断，数据未变化时不会重建，此处无需再调BuildTree
     PFEXQuestHelper.OnMapChange()
 end)
@@ -331,7 +335,11 @@ function PFEXQuestHelper.Browser:CreateNode(data, parentNode, level, pooledFrame
     end)
     button:SetScript("OnEnter", function()
         if node.clickType then button.texClickable:Show() else button.tex:Show() end
-        pfDatabase:ShowExtendedTooltip(data.id, GameTooltip, button, "ANCHOR_RIGHT", 0, 0)
+        local shown = type(pfDatabase.ShowExtendedTooltipHDB) == "function"
+            and pfDatabase:ShowExtendedTooltipHDB(data.id, GameTooltip, button, "ANCHOR_RIGHT", 0, 0)
+        if not shown then
+            pfDatabase:ShowExtendedTooltip(data.id, GameTooltip, button, "ANCHOR_RIGHT", 0, 0)
+        end
         GameTooltip:AddLine(" ", 0.55, 0.55, 0.55);
         if node.clickType == "FINDPRE" then
             GameTooltip:AddLine(pfExtend_Loc["Click to fix on the map"], 0.55, 0.55, 0.55);
@@ -637,14 +645,59 @@ local function getcluster(tbl, name)
     return cache[cacheindex][1], cache[cacheindex][2], cache[cacheindex][3]
 end
 
+-- HDB path: start-location pins come straight from questStartPinRows, cached
+-- synchronously during UpdateDatabaseHDB's one bulk sweep -- no per-node
+-- query. That sweep only covers start locations, so quest-end (turn-in)
+-- pins are skipped here rather than firing a GetQuestMapPinsAsync per tree
+-- node: a zone's tree can be 100+ nodes, and one query per node is exactly
+-- the burst pattern that already crashed the client twice this session
+-- (loot browser rows, then quest metadata). Start pins are the useful half
+-- anyway -- where to pick the quest up -- turn-in pins are a nice-to-have.
+function PFEXQuestHelper.AddMapNodeHDB(id, ispfDB)
+    local title = PFEXQuestHelper.GetQuestTitle(id)
+    if not title then return nil end
+    local displayTitle = title .. " (" .. id .. ")"
+
+    local rows = PFEXQuestHelper.GetQuestStartPinRows(id)
+    if not rows then return displayTitle end
+
+    for _, row in ipairs(rows) do
+        local meta = {
+            addon = "PFEX",
+            questid = id,
+            quest = displayTitle,
+            title = displayTitle,
+            zone = row.zoneID, x = row.x, y = row.y,
+            spawn = row.title,
+            spawnid = row.targetID,
+            spawntype = row.targetKind == "O" and pfQuest_Loc["Object"] or pfQuest_Loc["Unit"],
+            level = row.level or UNKNOWN,
+            respawn = row.respawn and SecondsToTime(row.respawn) or "N/A",
+            QTYPE = row.targetKind == "O" and "OBJECT_START" or "NPC_START",
+            texture = pfQuestConfig.path .. "\\img\\available_c",
+        }
+        if ispfDB then
+            pfMap:AddNode(meta)
+        else
+            PFEXQuestHelper.AddNode(meta)
+        end
+    end
+
+    return displayTitle
+end
+
 local unifiedcache = {}
 local similar_nodes = {}
 function PFEXQuestHelper.AddMapNode(id, ispfDB)
+    if PFEXQuestHelper.HasHDB() then
+        return PFEXQuestHelper.AddMapNodeHDB(id, ispfDB)
+    end
+
     local meta = { ["addon"] = "PFEX" }
     local maps = maps or {}
     local quests = pfDB["quests"]["data"]
     meta["questid"] = id
-    meta["quest"] = pfDB.quests.loc[id] and pfDB.quests.loc[id].T
+    meta["quest"] = PFEXQuestHelper.GetQuestTitle(id)
     if meta["quest"] then
         meta["quest"] = meta["quest"] .. " (" .. id .. ")"
     end
