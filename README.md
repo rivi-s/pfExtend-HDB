@@ -4,6 +4,10 @@ English | [简体中文](README-zhCN.md)
 
 pfExtend is an extension addon for [pfQuest](https://github.com/shagu/pfQuest), enhancing the gameplay experience by providing monster loot display and quest chain visualization functionalities. Compatible with **Turtle WoW** (1.12.0 client).
 
+### HDB Support
+
+This fork adds support for [pfQuest-HDB](https://github.com/rivi-s/pfQuest-HDB), querying its asynchronous SQLite database directly instead of requiring the full legacy Lua item/unit/quest database. When a pfQuest-HDB provider is detected, ShowLoots and QuestHelper both use it automatically; without one, the addon falls back to the original Lua-database behavior unchanged.
+
 ## Features
 
 ### ShowLoots - Monster Loot Display
